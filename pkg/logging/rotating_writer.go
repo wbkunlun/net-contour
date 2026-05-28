@@ -34,20 +34,20 @@ import (
 )
 
 func init() {
-	// Wire the rotating file writer into sharedmain's SetupLoggerOrDie
 	sharedmain.EnableFileLogging = EnableFileLogging
 }
 
 // RotationConfig holds file rotation settings from environment variables
 type RotationConfig struct {
-	LogDir         string
-	LogFileName    string
-	LogMaxSizeMB   int
-	LogMaxAgeHours int
-	LogMaxBackups  int
-	LogCompress    bool
-	LogTimeZone    string
-	LogEnableFile  bool
+	LogDir          string
+	LogFileName     string
+	LogMaxSizeMB    int
+	LogMaxAgeHours  int
+	LogMaxBackups   int
+	LogCompress     bool
+	LogTimeZone     string
+	LogEnableFile   bool
+	LogEnableStdout bool
 }
 
 // GetRotationConfig reads rotation config from environment variables with defaults
@@ -60,14 +60,15 @@ func GetRotationConfig(component string) *RotationConfig {
 	timeZone := getEnvOrDefault("LOG_TIMEZONE", "Asia/Shanghai")
 
 	return &RotationConfig{
-		LogDir:         getEnvOrDefault("LOG_DIR", "/logs"),
-		LogFileName:    fileName,
-		LogMaxSizeMB:   getEnvIntOrDefault("LOG_MAX_SIZE_MB", 100),
-		LogMaxAgeHours: getEnvIntOrDefault("LOG_MAX_AGE_HOURS", 24),
-		LogMaxBackups:  getEnvIntOrDefault("LOG_MAX_BACKUPS", 720),
-		LogCompress:    getEnvOrDefault("LOG_COMPRESS", "1") == "1",
-		LogTimeZone:    timeZone,
-		LogEnableFile:  getEnvOrDefault("LOG_ENABLE_FILE", "true") == "true",
+		LogDir:          getEnvOrDefault("LOG_DIR", "/logs"),
+		LogFileName:     fileName,
+		LogMaxSizeMB:    getEnvIntOrDefault("LOG_MAX_SIZE_MB", 100),
+		LogMaxAgeHours:  getEnvIntOrDefault("LOG_MAX_AGE_HOURS", 24),
+		LogMaxBackups:   getEnvIntOrDefault("LOG_MAX_BACKUPS", 720),
+		LogCompress:     getEnvOrDefault("LOG_COMPRESS", "1") == "1",
+		LogTimeZone:     timeZone,
+		LogEnableFile:   getEnvOrDefault("LOG_ENABLE_FILE", "true") == "true",
+		LogEnableStdout: getEnvOrDefault("LOG_STDOUT", "true") == "true",
 	}
 }
 
@@ -89,29 +90,31 @@ func getEnvIntOrDefault(key string, defaultVal int) int {
 
 // rotatingWriter implements log rotation with gzip compression support
 type rotatingWriter struct {
-	mu          sync.Mutex
-	logDir      string
-	baseName    string
-	maxSize     int64
-	maxAge      int
-	maxBackups  int
-	compress    bool
-	current     *os.File
-	currentSize int64
+	mu              sync.Mutex
+	logDir          string
+	baseName        string
+	maxSize         int64
+	maxAge          int
+	maxBackups      int
+	compress        bool
+	logEnableStdout bool
+	current         *os.File
+	currentSize     int64
 }
 
-func newRotatingWriter(logDir, baseName string, maxSizeMB, maxAgeHours, maxBackups int, compress bool) (*rotatingWriter, error) {
+func newRotatingWriter(logDir, baseName string, maxSizeMB, maxAgeHours, maxBackups int, compress bool, logEnableStdout bool) (*rotatingWriter, error) {
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create log directory: %w", err)
 	}
 
 	w := &rotatingWriter{
-		logDir:     logDir,
-		baseName:   baseName,
-		maxSize:    int64(maxSizeMB) * 1024 * 1024,
-		maxAge:     maxAgeHours,
-		maxBackups: maxBackups,
-		compress:   compress,
+		logDir:          logDir,
+		baseName:        baseName,
+		maxSize:         int64(maxSizeMB) * 1024 * 1024,
+		maxAge:          maxAgeHours,
+		maxBackups:      maxBackups,
+		compress:        compress,
+		logEnableStdout: logEnableStdout,
 	}
 
 	if err := w.openCurrent(); err != nil {
@@ -149,7 +152,6 @@ func (w *rotatingWriter) Write(p []byte) (n int, err error) {
 		}
 	}
 
-	// Check if we need to rotate
 	if w.currentSize+int64(len(p)) > w.maxSize {
 		if err := w.rotate(); err != nil {
 			return 0, err
@@ -162,13 +164,13 @@ func (w *rotatingWriter) Write(p []byte) (n int, err error) {
 	}
 	w.currentSize += int64(n)
 
-	// Also write to stdout for container log collection
-	os.Stdout.Write(p)
+	if w.logEnableStdout {
+		os.Stdout.Write(p)
+	}
 
 	return n, nil
 }
 
-// rotate performs log rotation
 func (w *rotatingWriter) rotate() error {
 	if w.current != nil {
 		w.current.Close()
@@ -292,6 +294,7 @@ func SetupRotatingFileWriter(cfg *RotationConfig) (zapcore.WriteSyncer, error) {
 		cfg.LogMaxAgeHours,
 		cfg.LogMaxBackups,
 		cfg.LogCompress,
+		cfg.LogEnableStdout,
 	)
 }
 
@@ -313,10 +316,19 @@ func buildEncoderFromJSON(zapConfigJSON string) zapcore.Encoder {
 }
 
 // EnableFileLogging wraps a zap logger to add rotating file output, enabled by default.
+// Set LOG_ENABLE_FILE=false to disable file logging.
+// Set LOG_STDOUT=false to disable stdout logging.
 func EnableFileLogging(logger *zap.SugaredLogger, zapConfigJSON string, component string) *zap.SugaredLogger {
 	cfg := GetRotationConfig(component)
-	if !cfg.LogEnableFile {
+
+	if !cfg.LogEnableFile && cfg.LogEnableStdout {
 		return logger
+	}
+
+	if !cfg.LogEnableFile && !cfg.LogEnableStdout {
+		return logger.WithOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
+			return zapcore.NewNopCore()
+		}))
 	}
 
 	fileWriter, err := SetupRotatingFileWriter(cfg)
@@ -325,13 +337,11 @@ func EnableFileLogging(logger *zap.SugaredLogger, zapConfigJSON string, componen
 		return logger
 	}
 
-	// Build encoder from the original zap config JSON to match format
 	enc := buildEncoderFromJSON(zapConfigJSON)
 	if enc == nil {
 		enc = zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig())
 	}
 
-	// Replace the core to write to rotating file (which also writes to stdout internally)
 	return logger.WithOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
 		return zapcore.NewCore(enc, fileWriter, core)
 	}))
